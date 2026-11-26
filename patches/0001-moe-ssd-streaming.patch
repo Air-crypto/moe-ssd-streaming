@@ -1,0 +1,653 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 93f8a72..60c5950 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3191,6 +3191,21 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+         st.ids = ids;
+     }
+ 
++    // uploads of host experts: collected, then read with parallel pread() straight into dst when dst is CPU-visible
++    // device memory (Metal shared buffers on unified memory) and the experts are in a mapped model file
++    static const bool pread_ok = [] { const char * e = getenv("LLAMA_MOE_PREAD"); return !(e && e[0] == '0'); }();
++    const bool dst_direct = pread_ok && dst->buffer && dst->data &&
++        std::string(ggml_backend_buffer_name(dst->buffer)).rfind("MTL", 0) == 0 &&
++        std::string(ggml_backend_buffer_name(dst->buffer)).find("_Private") == std::string::npos;
++    std::vector<llama_read_range> reads;
++    auto upload = [&](size_t offset, size_t size) {
++        if (dst_direct) {
++            reads.push_back({ (const uint8_t *) src->data + offset, (uint8_t *) dst->data + offset, size });
++        } else {
++            ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
++        }
++    };
++
+     // group consecutive experts and copy them together
+     for (int64_t first = 0; first < n_expert; ) {
+         if (!st.used[first]) {
+@@ -3211,7 +3226,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+                 continue;
+             }
+             if (next < e) {
+-                ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
++                upload(next*expert_size, (e - next)*expert_size);
+             }
+             e   += n;
+             next = e;
+@@ -3222,12 +3237,28 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+         const size_t padding = last < n_expert - 1 ? std::min<size_t>(expert_size, 512) : 0;
+         const size_t size    = (last + 1 - next)*expert_size + padding;
+         if (size > 0) {
+-            ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
++            // the padding past the last expert may run past the file's tensor data; keep it a plain copy
++            const size_t body = (last + 1 - next)*expert_size;
++            if (body > 0) { upload(offset, body); }
++            if (size > body) {
++                ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset + body, offset + body, size - body);
++            }
+         }
+ 
+         first = last + 1;
+     }
+ 
++    if (!reads.empty()) {
++        // the device may still be running earlier splits that use memory the allocator reused for dst
++        ggml_backend_synchronize(backend);
++    }
++    if (!reads.empty() && !llama_mmap_read_ranges(reads)) {
++        for (const auto & r : reads) {   // fall back to plain copies
++            const size_t off = (const uint8_t *) r.dst - (uint8_t *) dst->data;
++            ggml_backend_tensor_set_async(backend, dst, r.src, off, r.len);
++        }
++    }
++
+     return true;
+ }
+ 
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 5fef4c4..befc240 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2541,6 +2541,29 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         }
+     }
+ 
++    // expert prediction for the next MoE layer: its router applied to this layer's expert input, for single-token
++    // decode steps only. Built before the lookup so it is computed before llama_moe_cache::copy() runs for this layer
++    static const int predict_k = [] { const char * e = getenv("LLAMA_MOE_PREDICT_K"); return e ? atoi(e) : 0; }();
++    if (moe_cache != nullptr && predict_k > 0 && n_tokens == 1 && il + 1 < (int) model.layers.size()) {
++        const auto & nl = model.layers[il + 1];
++        if (nl.ffn_gate_inp != nullptr && nl.ffn_gate_inp->ne[0] == n_embd && nl.ffn_gate_inp->ne[1] == n_expert) {
++            ggml_tensor * pl = ggml_mul_mat(ctx0, nl.ffn_gate_inp, cur);
++            switch (gating_op) {
++                case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID:      pl = ggml_sigmoid(ctx0, pl); break;
++                case LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS: pl = ggml_sqrt(ctx0, ggml_softplus(ctx0, pl)); break;
++                default: break;
++            }
++            if (nl.ffn_exp_probs_b != nullptr) {
++                pl = ggml_add(ctx0, pl, nl.ffn_exp_probs_b);
++            }
++            ggml_tensor * pid = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, pl, std::min<int>(predict_k, (int) n_expert)));
++            cb(pid, "ffn_moe_predicted_next", il);
++            ggml_set_output(pid);
++            ggml_build_forward_expand(gf, pid);
++            moe_cache->set_prediction(il, pid);
++        }
++    }
++
+     // compute the expert input before the slot lookup, so that the scheduler prefetches it for the CPU part (the router can read a different tensor)
+     ggml_build_forward_expand(gf, cur);
+ 
+diff --git a/src/llama-mmap.cpp b/src/llama-mmap.cpp
+index 02e4ede..758b966 100644
+--- a/src/llama-mmap.cpp
++++ b/src/llama-mmap.cpp
+@@ -1,5 +1,10 @@
+ #include "llama-mmap.h"
+ 
++#include <algorithm>
++#include <condition_variable>
++#include <mutex>
++#include <thread>
++
+ #include "llama-impl.h"
+ 
+ #include "ggml.h"
+@@ -701,6 +706,91 @@ static llama_mmap::ranges ranges_complement(llama_mmap::ranges ranges, size_t li
+ }
+ #endif
+ 
++#ifdef _POSIX_MAPPED_FILES
++namespace {
++struct mmap_registry_entry { const char * addr; size_t size; int fd; };
++std::mutex & mmap_registry_mutex() { static std::mutex m; return m; }
++std::vector<mmap_registry_entry> & mmap_registry() { static std::vector<mmap_registry_entry> r; return r; }
++}
++
++bool llama_mmap_file_range(const void * p, int * fd, size_t * offset) {
++    std::lock_guard<std::mutex> lock(mmap_registry_mutex());
++    for (const auto & e : mmap_registry()) {
++        if ((const char *) p >= e.addr && (const char *) p < e.addr + e.size) {
++            *fd = e.fd;
++            *offset = (size_t) ((const char *) p - e.addr);
++            return true;
++        }
++    }
++    return false;
++}
++
++namespace {
++// fixed pool of readers for llama_mmap_read_ranges
++struct read_pool {
++    struct job { int fd; size_t off; size_t len; uint8_t * dst; };
++    std::vector<std::thread> threads;
++    std::mutex m;
++    std::condition_variable cv_work, cv_done;
++    std::vector<job> jobs;
++    size_t next = 0, n_done = 0;
++    bool failed = false, stop = false;
++    explicit read_pool(int n) { for (int i = 0; i < n; ++i) { threads.emplace_back([this] { loop(); }); } }
++    ~read_pool() {
++        { std::lock_guard<std::mutex> lk(m); stop = true; }
++        cv_work.notify_all();
++        for (auto & t : threads) { t.join(); }
++    }
++    void loop() {
++        std::unique_lock<std::mutex> lk(m);
++        while (true) {
++            cv_work.wait(lk, [&] { return stop || next < jobs.size(); });
++            if (stop) { return; }
++            const job j = jobs[next++];
++            lk.unlock();
++            bool ok = true;
++            for (size_t got = 0; got < j.len; ) {
++                const ssize_t r = pread(j.fd, j.dst + got, j.len - got, (off_t) (j.off + got));
++                if (r <= 0) { ok = false; break; }
++                got += (size_t) r;
++            }
++            lk.lock();
++            failed |= !ok;
++            if (++n_done == jobs.size()) { cv_done.notify_all(); }
++        }
++    }
++    bool run(std::vector<job> && js) {
++        std::unique_lock<std::mutex> lk(m);
++        jobs = std::move(js); next = 0; n_done = 0; failed = false;
++        cv_work.notify_all();
++        cv_done.wait(lk, [&] { return n_done == jobs.size(); });
++        jobs.clear(); next = 0;
++        return !failed;
++    }
++};
++}
++
++bool llama_mmap_read_ranges(const std::vector<llama_read_range> & ranges) {
++    static read_pool pool([] { const char * e = getenv("LLAMA_MOE_PREAD_THREADS"); return e ? std::max(1, atoi(e)) : 16; }());
++    static std::mutex serial; // one batch at a time
++    constexpr size_t chunk = 1u << 20;
++    std::vector<read_pool::job> js;
++    for (const auto & r : ranges) {
++        int fd; size_t off;
++        if (!llama_mmap_file_range(r.src, &fd, &off)) { return false; }
++        for (size_t c = 0; c < r.len; c += chunk) {
++            js.push_back({ fd, off + c, std::min(chunk, r.len - c), (uint8_t *) r.dst + c });
++        }
++    }
++    if (js.empty()) { return true; }
++    std::lock_guard<std::mutex> lk(serial);
++    return pool.run(std::move(js));
++}
++#else
++bool llama_mmap_file_range(const void *, int *, size_t *) { return false; }
++bool llama_mmap_read_ranges(const std::vector<llama_read_range> &) { return false; }
++#endif
++
+ struct llama_mmap::impl {
+ #ifdef _POSIX_MAPPED_FILES
+     std::vector<std::pair<size_t, size_t>> mapped_fragments;
+@@ -752,8 +842,17 @@ struct llama_mmap::impl {
+         }
+ 
+         mapped_fragments.emplace_back(0, file->size());
++
++        // own fd for pread: the loader may close the file after loading
++        reg_fd = dup(fd);
++        if (reg_fd >= 0) {
++            std::lock_guard<std::mutex> lock(mmap_registry_mutex());
++            mmap_registry().push_back({ (const char *) addr, file->size(), reg_fd });
++        }
+     }
+ 
++    int reg_fd = -1;
++
+     static void align_range(size_t * first, size_t * last, size_t page_size) {
+         size_t offset_in_page = *first & (page_size - 1);
+         size_t offset_to_page = offset_in_page == 0 ? 0 : page_size - offset_in_page;
+@@ -803,6 +902,12 @@ struct llama_mmap::impl {
+     }
+ 
+     ~impl() {
++        if (reg_fd >= 0) {
++            std::lock_guard<std::mutex> lock(mmap_registry_mutex());
++            auto & r = mmap_registry();
++            r.erase(std::remove_if(r.begin(), r.end(), [&](const mmap_registry_entry & e) { return e.fd == reg_fd; }), r.end());
++            close(reg_fd);
++        }
+         for (const auto & frag : mapped_fragments) {
+             if (munmap((char *) addr + frag.first, frag.second - frag.first)) {
+                 LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
+diff --git a/src/llama-mmap.h b/src/llama-mmap.h
+index 39715bf..b2fb3cd 100644
+--- a/src/llama-mmap.h
++++ b/src/llama-mmap.h
+@@ -44,6 +44,17 @@ private:
+     std::unique_ptr<impl> pimpl;
+ };
+ 
++// Registry of live POSIX file mappings, so code holding a pointer into a mapped model can read the same bytes
++// with pread() (large parallel reads) instead of faulting the pages in one by one. See llama-moe-cache.cpp.
++// Returns false if p is not inside a registered mapping. The fd stays valid while the mapping lives.
++bool llama_mmap_file_range(const void * p, int * fd, size_t * offset);
++
++// Copies [src, src+len) of mapped model files to dst with parallel pread() calls (LLAMA_MOE_PREAD_THREADS readers,
++// 1 MiB pieces) instead of faulting the mmap in page by page. Returns false (and copies nothing) if a source is
++// not inside a registered mapping or a read fails; the caller then falls back to a plain copy.
++struct llama_read_range { const void * src; void * dst; size_t len; };
++bool llama_mmap_read_ranges(const std::vector<llama_read_range> & ranges);
++
+ struct llama_mmap {
+     // list of [first, last) byte ranges within a file
+     using ranges = std::vector<std::pair<size_t, size_t>>;
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index ba35af0..1e83abd 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -4,6 +4,7 @@
+ #include "llama-impl.h"
+ #include "llama-memory.h"
+ #include "llama-model.h"
++#include "llama-mmap.h"
+ 
+ #include "ggml-cpp.h"
+ 
+@@ -14,10 +15,93 @@
+ #include <cstring>
+ #include <stdexcept>
+ #include <unordered_map>
++#include <string>
+ #include <vector>
+ 
++#include <atomic>
++#include <condition_variable>
++#include <mutex>
++#include <thread>
++#ifndef _WIN32
++#include <unistd.h>
++#endif
++
+ namespace {
+ 
++// Reads cache misses from the model files with large parallel pread() calls instead of page faults on the mmap.
++// An SSD serves one 16-48 KiB page fault at a time at well under 1 GB/s, but several multi-MiB reads at once at
++// over 10 GB/s, so this is the difference between I/O-bound and compute-bound for experts streamed from disk.
++// LLAMA_MOE_PREAD=0 disables it; LLAMA_MOE_PREAD_THREADS sets the number of readers (default 16).
++struct moe_pread_pool {
++    struct job { int fd; size_t off; size_t len; uint8_t * dst; };
++
++    std::vector<std::thread> threads;
++    std::mutex m;
++    std::condition_variable cv_work, cv_done;
++    std::vector<job> jobs;
++    size_t next = 0, n_done = 0;
++    std::atomic<bool> failed{false};
++    bool stop = false;
++
++    explicit moe_pread_pool(int n) {
++        for (int i = 0; i < n; ++i) {
++            threads.emplace_back([this] { loop(); });
++        }
++    }
++    ~moe_pread_pool() {
++        { std::lock_guard<std::mutex> lk(m); stop = true; }
++        cv_work.notify_all();
++        for (auto & t : threads) { t.join(); }
++    }
++    void loop() {
++        std::unique_lock<std::mutex> lk(m);
++        while (true) {
++            cv_work.wait(lk, [&] { return stop || next < jobs.size(); });
++            if (stop) { return; }
++            const job j = jobs[next++];
++            lk.unlock();
++#ifndef _WIN32
++            size_t got = 0;
++            while (got < j.len) {
++                const ssize_t r = pread(j.fd, j.dst + got, j.len - got, (off_t) (j.off + got));
++                if (r <= 0) { failed = true; break; }
++                got += (size_t) r;
++            }
++#else
++            failed = true;
++#endif
++            lk.lock();
++            if (++n_done == jobs.size()) { cv_done.notify_all(); }
++        }
++    }
++    // starts jobs without waiting (one batch at a time per pool); wait() blocks until they are done
++    void start(std::vector<job> && js) {
++        std::unique_lock<std::mutex> lk(m);
++        jobs = std::move(js); next = 0; n_done = 0; failed = false;
++        busy = !jobs.empty();
++        cv_work.notify_all();
++    }
++    bool wait() {
++        std::unique_lock<std::mutex> lk(m);
++        cv_done.wait(lk, [&] { return n_done == jobs.size(); });
++        jobs.clear(); next = 0; busy = false;
++        return !failed;
++    }
++    bool busy = false;
++
++    // runs all jobs, returns false if any read failed
++    bool run(std::vector<job> && js) {
++        if (js.empty()) { return true; }
++        std::unique_lock<std::mutex> lk(m);
++        jobs = std::move(js); next = 0; n_done = 0; failed = false;
++        cv_work.notify_all();
++        cv_done.wait(lk, [&] { return n_done == jobs.size(); });
++        jobs.clear(); next = 0;
++        return !failed;
++    }
++};
++
++
+ // ClassLRU: one LRU list per frequency class, over the experts of a group of layers
+ // slot_map[il][e] is the slot of expert e of layer il, n_slots or later if not cached, the host slot map tensor
+ // CRF (combined recency and frequency) = uses of an expert, decayed with a half-life of N tokens, retained across evictions
+@@ -388,6 +472,28 @@ struct llama_moe_cache::impl {
+     uint32_t cpu_share_q = 0; // cpu_share in 1/65536, integer so that a simulator can reproduce the rounding
+     int32_t  n_zero    = 0; // zero slots per group
+ 
++    // expert prediction / prefetch (see set_prediction)
++    std::unordered_map<int32_t, ggml_tensor *> predicted; // layer -> predicted ids of the next MoE layer, this graph
++    std::vector<int32_t> pred_ids;
++    std::unique_ptr<moe_pread_pool> prefetch_pool;
++    struct prefetch_t {
++        int32_t il = -1;                                     // layer the prefetch is for
++        std::vector<int32_t> experts;                        // prefetched experts
++        std::vector<uint8_t> bufs[2];                        // [expert][tensor] bytes, double-buffered: the uploads
++        int cur = 0;                                         // from one may still be in flight while the next is read
++        std::vector<size_t>  off;                            // offset of expert i, tensor ip in buf: off[i*n_tensors + ip]
++        bool pending = false;
++    } pf;
++    std::unordered_map<int32_t, std::vector<int32_t>> last_pred; // layer -> experts predicted for it, for recall stats
++    size_t pred_sel = 0, pred_hit = 0, pf_issued = 0, pf_used = 0, pf_bytes_used = 0;
++
++    // LLAMA_MOE_PREAD: parallel reads of the misses, into staging, then uploaded
++    std::unique_ptr<moe_pread_pool> pread_pool;
++    std::vector<uint8_t> staging;
++    size_t pread_bytes = 0, pread_fallback = 0, pread_calls = 0, n_copy = 0;
++    double sync_s = 0.0, rest_s = 0.0; // copy(): waiting for the device, and planning + reads + upload calls
++    double pread_s = 0.0;
++
+     // LLAMA_MOE_CACHE_TRACE: the selected experts of each slot lookup, for a simulator of the cache
+     FILE * trace = nullptr;
+ 
+@@ -801,9 +907,27 @@ struct llama_moe_cache::impl {
+ 
+         const int32_t n_used = (int32_t) sel->src[0]->ne[0];
+ 
++        const int64_t t_copy0 = ggml_time_us();
+         ids.resize(ggml_nelements(sel));
+         ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
++        ggml_tensor * pred = nullptr;
++        if (const auto pit = predicted.find(il); pit != predicted.end() && (int64_t) ids.size() == sel->src[0]->ne[0]) {
++            pred = pit->second;
++            pred_ids.resize(ggml_nelements(pred));
++            ggml_backend_tensor_get_async(backend, pred, pred_ids.data(), 0, ggml_nbytes(pred));
++        }
+         ggml_backend_synchronize(backend);
++        const int64_t t_sync1 = ggml_time_us();
++        sync_s += (t_sync1 - t_copy0)*1e-6;
++
++        // prediction recall: the experts predicted for this layer (by the layer below) vs the ones selected
++        if (const auto lp = last_pred.find(il); lp != last_pred.end() && (int64_t) ids.size() == sel->src[0]->ne[0]) {
++            for (int32_t e : ids) {
++                pred_sel++;
++                pred_hit += std::find(lp->second.begin(), lp->second.end(), e) != lp->second.end();
++            }
++            last_pred.erase(lp);
++        }
+ 
+         if (trace != nullptr) {
+             write_trace(il, n_used);
+@@ -833,6 +957,8 @@ struct llama_moe_cache::impl {
+         }
+ 
+         // upload the missing experts, consecutive experts going to consecutive slots are uploaded together
++        struct run { ggml_tensor * bank; const uint8_t * src; size_t dst_off; size_t len; };
++        std::vector<run> runs;
+         size_t bytes = 0;
+         for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+             const ggml_tensor * w    = l.experts[ip];
+@@ -843,11 +969,98 @@ struct llama_moe_cache::impl {
+                 while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
+                     n++;
+                 }
+-                ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + fills[i].expert*expert_size, fills[i].slot*expert_size, n*expert_size);
++                runs.push_back({ bank, (const uint8_t *) w->data + fills[i].expert*expert_size, fills[i].slot*expert_size, n*expert_size });
+                 bytes += n*expert_size;
+                 i += n;
+             }
+         }
++        // experts prefetched for this layer: upload them from the prefetch buffer instead of reading them again
++        if (pf.pending && pf.il == il) {
++            const bool ok = prefetch_pool->wait();
++            pf.pending = false;
++            if (ok) {
++                std::vector<run> rest;
++                const size_t n_t = l.experts.size();
++                for (const auto & r : runs) {
++                    // runs are per tensor and may span consecutive experts; split them per expert
++                    int32_t ip = -1;
++                    for (size_t k = 0; k < n_t; ++k) { if (g.banks[k] == r.bank) { ip = (int32_t) k; } }
++                    const size_t esz = l.experts[ip]->nb[2];
++                    const int32_t e0 = (int32_t) ((r.src - (const uint8_t *) l.experts[ip]->data) / esz);
++                    for (size_t c = 0; c < r.len / esz; ++c) {
++                        const int32_t e = e0 + (int32_t) c;
++                        const auto it = std::find(pf.experts.begin(), pf.experts.end(), e);
++                        if (it != pf.experts.end()) {
++                            const size_t i = (size_t) (it - pf.experts.begin());
++                            ggml_backend_tensor_set_async(backend, r.bank, pf.bufs[pf.cur].data() + pf.off[i*n_t + ip], r.dst_off + c*esz, esz);
++                            pf_bytes_used += esz;
++                            if (ip == 0) { pf_used++; }
++                        } else {
++                            rest.push_back({ r.bank, r.src + c*esz, r.dst_off + c*esz, esz });
++                        }
++                    }
++                }
++                size_t rest_bytes = 0;
++                for (const auto & r : rest) { rest_bytes += r.len; }
++                upload_runs(backend, rest, rest_bytes);
++            } else {
++                upload_runs(backend, runs, bytes);
++            }
++        } else {
++            upload_runs(backend, runs, bytes);
++        }
++
++        // start reading the predicted misses of the next MoE layer while this layer computes
++        if (pred != nullptr) {
++            const int32_t jl = il + 1;
++            last_pred[jl].assign(pred_ids.begin(), pred_ids.end());
++            static const bool do_prefetch = [] { const char * e = getenv("LLAMA_MOE_PREFETCH"); return e && e[0] == '1'; }();
++            if (pf.pending && pf.il != jl) {   // a prefetch whose layer never came (end of the step): drop it
++                prefetch_pool->wait();
++                pf.pending = false;
++            }
++            if (do_prefetch && jl < (int32_t) layers.size() && layers[jl].ig >= 0 && !pf.pending) {
++                const layer & nl = layers[jl];
++                const group & ng = groups[nl.ig];
++                const int32_t * nslots = ng.lru.slot_map[jl];
++                pf.experts.clear();
++                for (int32_t e : pred_ids) {
++                    if (e >= 0 && nslots != nullptr && nslots[e] >= ng.lru.n_slots) { pf.experts.push_back(e); }
++                }
++                if (!pf.experts.empty()) {
++                    const size_t n_t = nl.experts.size();
++                    size_t per = 0;
++                    for (const ggml_tensor * w : nl.experts) { per += w->nb[2]; }
++                    pf.cur ^= 1;
++                    std::vector<uint8_t> & buf = pf.bufs[pf.cur];
++                    if (buf.size() < per*pf.experts.size()) { buf.resize(per*pf.experts.size()); }
++                    pf.off.assign(pf.experts.size()*n_t, 0);
++                    std::vector<moe_pread_pool::job> js;
++                    size_t at = 0;
++                    bool ok = true;
++                    for (size_t i = 0; i < pf.experts.size() && ok; ++i) {
++                        for (size_t ip = 0; ip < n_t; ++ip) {
++                            const ggml_tensor * w = nl.experts[ip];
++                            const size_t esz = w->nb[2];
++                            int fd; size_t off;
++                            if (!llama_mmap_file_range((const uint8_t *) w->data + pf.experts[i]*esz, &fd, &off)) { ok = false; break; }
++                            pf.off[i*n_t + ip] = at;
++                            for (size_t c = 0; c < esz; c += (1u << 20)) {
++                                js.push_back({ fd, off + c, std::min<size_t>(1u << 20, esz - c), buf.data() + at + c });
++                            }
++                            at += esz;
++                        }
++                    }
++                    if (ok) {
++                        if (!prefetch_pool) { prefetch_pool = std::make_unique<moe_pread_pool>(8); }
++                        pf.il = jl;
++                        pf.pending = true;
++                        pf_issued += pf.experts.size();
++                        prefetch_pool->start(std::move(js));
++                    }
++                }
++            }
++        }
+ 
+         stats & st = ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
+         st.hits   += n_hit;
+@@ -857,10 +1070,83 @@ struct llama_moe_cache::impl {
+ 
+         // the next copy synchronizes the backend before it changes the slot map again
+         ggml_backend_tensor_set_async(backend, dst, l.slot_map->data, 0, ggml_nbytes(l.slot_map));
++        rest_s += (ggml_time_us() - t_sync1)*1e-6;
++        n_copy++;
+ 
+         return true;
+     }
+ 
++    template <typename R>
++    void upload_runs(ggml_backend_t backend, const std::vector<R> & runs, size_t bytes) {
++        static const bool enabled = [] { const char * e = getenv("LLAMA_MOE_PREAD"); return !(e && e[0] == '0'); }();
++        bool done = false;
++        if (enabled && !runs.empty()) {
++            if (!pread_pool) {
++                const char * e = getenv("LLAMA_MOE_PREAD_THREADS");
++                pread_pool = std::make_unique<moe_pread_pool>(e ? std::max(1, atoi(e)) : 16);
++            }
++            // Banks in CPU-visible device memory (Metal shared buffers on unified memory) are read into directly:
++            // no staging copy. The backend was synchronized at the start of copy(), so nothing reads the slots now.
++            static const bool direct_ok = [] { const char * e = getenv("LLAMA_MOE_PREAD_DIRECT"); return !(e && e[0] == '0'); }();
++            auto direct = [&](const ggml_tensor * bank) {
++                if (!direct_ok || bank->buffer == nullptr || bank->data == nullptr) { return false; }
++                const std::string name = ggml_backend_buffer_name(bank->buffer);
++                return name.rfind("MTL", 0) == 0 && name.find("_Private") == std::string::npos;
++            };
++            const bool all_direct = std::all_of(runs.begin(), runs.end(), [&](const R & r) { return direct(r.bank); });
++            // the backend was synchronized at the start of copy(), so the previous uploads from staging are done
++            if (!all_direct && staging.size() < bytes) { staging.resize(bytes); }
++            static const size_t chunk = [] { const char * e = getenv("LLAMA_MOE_PREAD_CHUNK_KIB"); return (size_t) (e ? std::max(64, atoi(e)) : 1024) << 10; }();
++            std::vector<moe_pread_pool::job> js;
++            size_t at = 0;
++            bool ok = true;
++            for (const auto & r : runs) {
++                int fd; size_t off;
++                if (!llama_mmap_file_range(r.src, &fd, &off)) { ok = false; break; }
++                uint8_t * dst = all_direct ? (uint8_t *) r.bank->data + r.dst_off : staging.data() + at;
++                for (size_t c = 0; c < r.len; c += chunk) {
++                    js.push_back({ fd, off + c, std::min(chunk, r.len - c), dst + c });
++                }
++                at += r.len;
++            }
++            if (ok) {
++                const int64_t t0 = ggml_time_us();
++                ok = pread_pool->run(std::move(js));
++                pread_s += (ggml_time_us() - t0)*1e-6;
++            }
++            if (ok) {
++                at = 0;
++                for (const auto & r : runs) {
++                    if (!all_direct) {
++                        ggml_backend_tensor_set_async(backend, r.bank, staging.data() + at, r.dst_off, r.len);
++                    }
++                    at += r.len;
++                }
++                pread_bytes += bytes;
++                done = true;
++                if (++pread_calls % 2000 == 0) {
++                    fprintf(stderr, "llama_moe_cache: pread: %.2f GiB in %.1f s (%.2f GB/s); hits %zu misses %zu (%.1f%% hit)\n",
++                        pread_bytes/1073741824.0, pread_s, pread_s > 0 ? pread_bytes/pread_s/1e9 : 0.0,
++                        stats_small.hits, stats_small.misses,
++                        100.0*stats_small.hits/std::max<size_t>(1, stats_small.hits + stats_small.misses));
++                    fprintf(stderr, "llama_moe_cache: copy() x%zu: waiting for the device %.1f s, plan+read+upload %.1f s (pread %.1f s)\n",
++                        n_copy, sync_s, rest_s, pread_s);
++                    if (pred_sel > 0) {
++                        fprintf(stderr, "llama_moe_cache: prediction recall %.1f%%; prefetched %zu experts, %zu used (%.1f%%)\n",
++                            100.0*pred_hit/pred_sel, pf_issued, pf_used, 100.0*pf_used/std::max<size_t>(1, pf_issued));
++                    }
++                }
++            } else {
++                pread_fallback++;
++            }
++        }
++        if (!done) {
++            for (const auto & r : runs) {
++                ggml_backend_tensor_set_async(backend, r.bank, r.src, r.dst_off, r.len);
++            }
++        }
++    }
++
+     void log_stats() const {
+         auto log = [](const char * name, const stats & st) {
+             const size_t n = st.hits + st.misses;
+@@ -870,6 +1156,10 @@ struct llama_moe_cache::impl {
+             LLAMA_LOG_INFO("llama_moe_cache: %s: hits = %zu, misses = %zu (%zu on the CPU), hit rate = %.2f%%, uploaded = %.2f MiB\n",
+                 name, st.hits, st.misses, st.cpu, 100.0*st.hits/n, st.bytes/1024.0/1024.0);
+         };
++        if (pread_bytes > 0 || pread_fallback > 0) {
++            LLAMA_LOG_INFO("llama_moe_cache: pread: %.2f GiB in %.1f s (%.2f GB/s), %zu fallbacks to mmap\n",
++                pread_bytes/1073741824.0, pread_s, pread_s > 0 ? pread_bytes/pread_s/1e9 : 0.0, pread_fallback);
++        }
+         log("ubatch <= 8", stats_small);
+         log("ubatch  > 8", stats_large);
+         if (stats_copy.hits > 0) {
+@@ -962,6 +1252,10 @@ ggml_tensor * llama_moe_cache::build_experts(const llm_graph_context & g, const
+     return experts;
+ }
+ 
++void llama_moe_cache::set_prediction(int32_t il, ggml_tensor * ids) const {
++    pimpl->predicted[il] = ids;
++}
++
+ bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
+     return pimpl->copy(backend, src, dst, graph);
+ }
+diff --git a/src/llama-moe-cache.h b/src/llama-moe-cache.h
+index 833eac3..7869cba 100644
+--- a/src/llama-moe-cache.h
++++ b/src/llama-moe-cache.h
+@@ -53,6 +53,11 @@ public:
+     ggml_tensor * build_experts(const llm_graph_context & g, const llama_moe_cache_lookup & lookup,
+             ggml_tensor * cur, ggml_tensor * selected_experts, llama_moe_cache_build_experts_t build, void * user_data) const;
+ 
++    // expert prediction (LLAMA_MOE_PREDICT_K): ids [k, n_tokens] of the experts the next MoE layer is predicted to
++    // select, computed from this layer's expert input with the next layer's router. Read in copy() of layer il to
++    // prefetch the predicted misses of the next layer while this layer computes (LLAMA_MOE_PREFETCH=1)
++    void set_prediction(int32_t il, ggml_tensor * ids) const;
++
+     // ggml_backend_sched copy callback, returns false if src is not a slot map
+     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
+ 
