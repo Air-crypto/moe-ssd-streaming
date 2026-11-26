@@ -98,7 +98,7 @@ index 5fef4c4..befc240 100644
      ggml_build_forward_expand(gf, cur);
  
 diff --git a/src/llama-mmap.cpp b/src/llama-mmap.cpp
-index 02e4ede..758b966 100644
+index 02e4ede..bce5e48 100644
 --- a/src/llama-mmap.cpp
 +++ b/src/llama-mmap.cpp
 @@ -1,5 +1,10 @@
@@ -204,13 +204,31 @@ index 02e4ede..758b966 100644
  struct llama_mmap::impl {
  #ifdef _POSIX_MAPPED_FILES
      std::vector<std::pair<size_t, size_t>> mapped_fragments;
-@@ -752,8 +842,17 @@ struct llama_mmap::impl {
+@@ -752,8 +842,35 @@ struct llama_mmap::impl {
          }
  
          mapped_fragments.emplace_back(0, file->size());
 +
 +        // own fd for pread: the loader may close the file after loading
-+        reg_fd = dup(fd);
++        reg_fd = -1;
++#ifdef __APPLE__
++        // the expert reads bypass the page cache by default: faster (DMA into the destination) and they do not evict
++        // the pages of the mapping that are read through faults (Engram tables, dense weights)
++        static const bool nocache = [] { const char * e = getenv("LLAMA_MOE_PREAD_NOCACHE"); return !(e && e[0] == '0'); }();
++        if (nocache) {
++            char path[PATH_MAX];
++            if (fcntl(fd, F_GETPATH, path) != -1) {
++                reg_fd = open(path, O_RDONLY | O_CLOEXEC);
++                if (reg_fd >= 0 && fcntl(reg_fd, F_NOCACHE, 1) == -1) {
++                    close(reg_fd);
++                    reg_fd = -1;
++                }
++            }
++        }
++#endif
++        if (reg_fd < 0) {
++            reg_fd = dup(fd);
++        }
 +        if (reg_fd >= 0) {
 +            std::lock_guard<std::mutex> lock(mmap_registry_mutex());
 +            mmap_registry().push_back({ (const char *) addr, file->size(), reg_fd });
@@ -222,7 +240,7 @@ index 02e4ede..758b966 100644
      static void align_range(size_t * first, size_t * last, size_t page_size) {
          size_t offset_in_page = *first & (page_size - 1);
          size_t offset_to_page = offset_in_page == 0 ? 0 : page_size - offset_in_page;
-@@ -803,6 +902,12 @@ struct llama_mmap::impl {
+@@ -803,6 +920,12 @@ struct llama_mmap::impl {
      }
  
      ~impl() {
@@ -258,7 +276,7 @@ index 39715bf..b2fb3cd 100644
      // list of [first, last) byte ranges within a file
      using ranges = std::vector<std::pair<size_t, size_t>>;
 diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
-index ba35af0..1e83abd 100644
+index ba35af0..8b27660 100644
 --- a/src/llama-moe-cache.cpp
 +++ b/src/llama-moe-cache.cpp
 @@ -4,6 +4,7 @@
@@ -363,10 +381,58 @@ index ba35af0..1e83abd 100644
  // ClassLRU: one LRU list per frequency class, over the experts of a group of layers
  // slot_map[il][e] is the slot of expert e of layer il, n_slots or later if not cached, the host slot map tensor
  // CRF (combined recency and frequency) = uses of an expert, decayed with a half-life of N tokens, retained across evictions
-@@ -388,6 +472,28 @@ struct llama_moe_cache::impl {
+@@ -186,7 +270,7 @@ struct moe_cache_lru {
+     // returns false if the ids select more distinct experts than there are slots
+     template <typename F>
+     bool plan(int32_t il, const int32_t * ids, size_t n_ids, int64_t n_tokens, int32_t n_used, int32_t n_zero, F && n_cpu,
+-            std::vector<fill> & fills, std::vector<fill> & cpu, size_t & n_hit) {
++            std::vector<fill> & fills, std::vector<fill> & cpu, size_t & n_hit, int32_t skip_rank = 64) {
+         fills.clear();
+         cpu.clear();
+         n_hit = 0;
+@@ -222,15 +306,31 @@ struct moe_cache_lru {
+             }
+         }
+ 
++        // LLAMA_MOE_SKIP_RANK=r: a miss selected only at top-k rank r or lower (the smallest router weights) by every
++        // token of the ubatch is skipped: it reads a zero slot and contributes nothing. Changes the output (approximate).
++        size_t n_skip = 0;
++        if (skip_rank < n_used && n_zero > 0 && !misses.empty()) {
++            auto eligible = [&](int32_t e) {
++                for (size_t i = 0; i < n_ids; ++i) {
++                    if (ids[i] == e && (int32_t) (i % n_used) < skip_rank) { return false; }
++                }
++                return true;
++            };
++            std::stable_partition(misses.begin(), misses.end(), eligible);
++            while (n_skip < misses.size() && eligible(misses[n_skip])) { n_skip++; }
++        }
++
+         // the misses with the lowest CRF are left to the CPU, a miss that keeps being used gains CRF and enters the cache
+         // all misses are used at the same clock, so their CRF compare without decay
+-        const size_t n_c = std::min(n_cpu(misses.size()), misses.size());
+-        if (n_c > 0) {
++        const size_t n_c = n_skip > 0 ? n_skip : std::min(n_cpu(misses.size()), misses.size());
++        if (n_c > 0 && n_skip == 0) {
+             std::sort(misses.begin(), misses.end(), [&](int32_t a, int32_t b) {
+                 const float crf_a = crf[make_key(il, a)];
+                 const float crf_b = crf[make_key(il, b)];
+                 return crf_a != crf_b ? crf_a < crf_b : a < b;
+             });
++        }
++        if (n_c > 0) {
+             GGML_ASSERT((size_t) n_tokens*n_used == n_ids);
+             token_zero.assign(n_tokens, 0);
+             size_t n_keep = n_c;
+@@ -387,6 +487,32 @@ struct llama_moe_cache::impl {
+     float    cpu_share = 0.0f;
      uint32_t cpu_share_q = 0; // cpu_share in 1/65536, integer so that a simulator can reproduce the rounding
      int32_t  n_zero    = 0; // zero slots per group
- 
++    static int32_t skip_rank() {
++        static const int32_t r = [] { const char * e = getenv("LLAMA_MOE_SKIP_RANK"); return e ? std::max(1, atoi(e)) : 64; }();
++        return r;
++    }
++
 +    // expert prediction / prefetch (see set_prediction)
 +    std::unordered_map<int32_t, ggml_tensor *> predicted; // layer -> predicted ids of the next MoE layer, this graph
 +    std::vector<int32_t> pred_ids;
@@ -388,11 +454,28 @@ index ba35af0..1e83abd 100644
 +    size_t pread_bytes = 0, pread_fallback = 0, pread_calls = 0, n_copy = 0;
 +    double sync_s = 0.0, rest_s = 0.0; // copy(): waiting for the device, and planning + reads + upload calls
 +    double pread_s = 0.0;
-+
+ 
      // LLAMA_MOE_CACHE_TRACE: the selected experts of each slot lookup, for a simulator of the cache
      FILE * trace = nullptr;
+@@ -450,7 +576,7 @@ struct llama_moe_cache::impl {
  
-@@ -801,9 +907,27 @@ struct llama_moe_cache::impl {
+         // with misses on the CPU, the n_zero slots after the cached ones stay zero: the device computes these misses as zero
+         // one extra slot at the end, CUDA MMQ can read past the last expert
+-        n_zero = cpu_share > 0.0f ? std::min<int32_t>(n_expert_used, 64) : 0;
++        n_zero = cpu_share > 0.0f || skip_rank() < n_expert_used ? std::min<int32_t>(n_expert_used, 64) : 0;
+         auto alloc_size = [&](const group & g, int32_t n_slots) {
+             const size_t alignment = ggml_backend_buft_get_alignment(devices[g.id].buft);
+             size_t res = 0;
+@@ -705,7 +831,7 @@ struct llama_moe_cache::impl {
+     // the experts of layer il computed on the CPU: I32 [1, n_expert] in host memory, e for these experts, -1 for the others
+     // nullptr if no misses of layer il are computed on the CPU for ubatches of n_tokens tokens
+     ggml_tensor * get_cpu_map(int32_t il, int64_t n_tokens) const {
+-        if (il < 0 || il >= (int32_t) layers.size() || layers[il].cpu_map == nullptr) {
++        if (il < 0 || il >= (int32_t) layers.size() || layers[il].cpu_map == nullptr || cpu_share <= 0.0f) {
+             return nullptr;
+         }
+         // the scheduler would run the CPU part on a device that offloads such batches from host weights
+@@ -801,9 +927,27 @@ struct llama_moe_cache::impl {
  
          const int32_t n_used = (int32_t) sel->src[0]->ne[0];
  
@@ -420,7 +503,16 @@ index ba35af0..1e83abd 100644
  
          if (trace != nullptr) {
              write_trace(il, n_used);
-@@ -833,6 +957,8 @@ struct llama_moe_cache::impl {
+@@ -817,7 +961,7 @@ struct llama_moe_cache::impl {
+             return (size_t) (acc >> 16);
+         };
+         size_t n_hit = 0;
+-        if (!g.lru.plan(il, ids.data(), ids.size(), sel->src[0]->ne[1], n_used, n_zero, n_cpu, fills, cpu, n_hit)) {
++        if (!g.lru.plan(il, ids.data(), ids.size(), sel->src[0]->ne[1], n_used, n_zero, n_cpu, fills, cpu, n_hit, has_cpu ? 64 : skip_rank())) {
+             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
+         }
+         if (has_cpu) {
+@@ -833,6 +977,8 @@ struct llama_moe_cache::impl {
          }
  
          // upload the missing experts, consecutive experts going to consecutive slots are uploaded together
@@ -429,7 +521,7 @@ index ba35af0..1e83abd 100644
          size_t bytes = 0;
          for (size_t ip = 0; ip < l.experts.size(); ++ip) {
              const ggml_tensor * w    = l.experts[ip];
-@@ -843,11 +969,98 @@ struct llama_moe_cache::impl {
+@@ -843,11 +989,98 @@ struct llama_moe_cache::impl {
                  while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
                      n++;
                  }
@@ -529,7 +621,7 @@ index ba35af0..1e83abd 100644
  
          stats & st = ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
          st.hits   += n_hit;
-@@ -857,10 +1070,83 @@ struct llama_moe_cache::impl {
+@@ -857,10 +1090,83 @@ struct llama_moe_cache::impl {
  
          // the next copy synchronizes the backend before it changes the slot map again
          ggml_backend_tensor_set_async(backend, dst, l.slot_map->data, 0, ggml_nbytes(l.slot_map));
@@ -613,7 +705,7 @@ index ba35af0..1e83abd 100644
      void log_stats() const {
          auto log = [](const char * name, const stats & st) {
              const size_t n = st.hits + st.misses;
-@@ -870,6 +1156,10 @@ struct llama_moe_cache::impl {
+@@ -870,6 +1176,10 @@ struct llama_moe_cache::impl {
              LLAMA_LOG_INFO("llama_moe_cache: %s: hits = %zu, misses = %zu (%zu on the CPU), hit rate = %.2f%%, uploaded = %.2f MiB\n",
                  name, st.hits, st.misses, st.cpu, 100.0*st.hits/n, st.bytes/1024.0/1024.0);
          };
@@ -624,7 +716,7 @@ index ba35af0..1e83abd 100644
          log("ubatch <= 8", stats_small);
          log("ubatch  > 8", stats_large);
          if (stats_copy.hits > 0) {
-@@ -962,6 +1252,10 @@ ggml_tensor * llama_moe_cache::build_experts(const llm_graph_context & g, const
+@@ -962,6 +1272,10 @@ ggml_tensor * llama_moe_cache::build_experts(const llm_graph_context & g, const
      return experts;
  }
  

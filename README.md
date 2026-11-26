@@ -73,6 +73,8 @@ An expert matrix here is about 6 MiB, so a layer's misses are a handful of large
 | `LLAMA_MOE_PREAD_DIRECT` | `1` | `0` reads into a staging buffer and uploads from it |
 | `LLAMA_MOE_PREDICT_K` | `0` | experts predicted per layer for the next layer |
 | `LLAMA_MOE_PREFETCH` | `0` | `1` prefetches the predicted misses |
+| `LLAMA_MOE_PREAD_NOCACHE` | `1` | macOS: the reads bypass the page cache (`F_NOCACHE`); `0` reads through it |
+| `LLAMA_MOE_SKIP_RANK` | off | approximate: skip uncached experts picked only at top-k rank ≥ r (see below) |
 
 ## Where the time goes now
 
@@ -86,6 +88,41 @@ Measured from the patch's own counters during decode, about 700 tokens:
   overhead, and the CPU parts.
 
 Before item 2 removed it, another 30% went into copying from a staging buffer into the cache.
+
+## Decode profile
+
+Measured with `sample` on the server process over 20 s of decode, with DSpark on and the 60 GiB cache:
+
+| activity | share of decode time |
+|---|---:|
+| waiting on the SSD reads of cache misses | 54% |
+| waiting for the GPU (attention, Engram, router, experts) | ~35% |
+| DSpark drafting | 4% |
+| Engram row prefetch (`madvise`) | 1% |
+
+Reads and GPU compute run strictly one after the other: a layer's experts are known only once its router
+has run, and the next layer needs this layer's output.
+
+What didn't help:
+- **Bypassing the page cache** (`F_NOCACHE`): 13.0 GB/s against 12.8, the same tok/s. It's kept on, because
+  it stops expert reads evicting the Engram pages.
+- **`--moe-cache-cpu-share 0.5`** (the CPU computes half the misses while the GPU computes the hits): 2.3–3
+  tok/s, because the CPU reads its experts through page faults.
+
+## Cache-aware expert skipping (approximate)
+
+`LLAMA_MOE_SKIP_RANK=r`, decode only: an uncached expert that every token of the ubatch picked only at top-k
+rank ≥ r is skipped. It reads a zero slot and contributes nothing, so its SSD read is saved. Prefill is
+exact. This is in the spirit of cache-conditional routing for on-device MoE.
+
+| setting | decode tok/s (3 prompts) | GSM8K (30 items) | MMLU-Pro (28 items) |
+|---|---:|---:|---:|
+| off (default) | 8.3 – 11.1 | 100% | 85.7% |
+| `r=5`: skip the 6th of 6 | 9.7 – 12.5 | 96.7% | 85.7% |
+| `r=4`: skip the 5th and 6th | 11.7 – 14.8 | not measured | not measured |
+
+With 30 items, one question is ±3.3%, so `r=5` shows no clear loss at that sample size. The outputs do
+change, though, so it stays off by default.
 
 ## Negative result: expert prediction
 
